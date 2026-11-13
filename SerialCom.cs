@@ -91,7 +91,6 @@ namespace SerialCom
             collapseFilter.Text = serialSettings.CollapseText;
             sendText.Text = serialSettings.SendText;
             showTimestamps.Checked = serialSettings.ShowTime;
-            follow.Checked = serialSettings.AutoScroll;
             hexDisplay.Checked = serialSettings.HexDisplay;
             hexSend.Checked = serialSettings.HexSend;
             sendEnding.Items.AddRange(new object[] { "不追加", "回车\\r", "换行\\n", "回车换行", "换行回车" });
@@ -199,7 +198,6 @@ namespace SerialCom
             collapseFilter.TextChanged += QueueSave;
             sendText.TextChanged += QueueSave;
             showTimestamps.CheckedChanged += QueueSave;
-            follow.CheckedChanged += QueueSave;
             hexDisplay.CheckedChanged += QueueSave;
             hexSend.CheckedChanged += ChangeSendMode;
             hexSend.CheckedChanged += QueueSave;
@@ -262,7 +260,6 @@ namespace SerialCom
             KeywordRules.Sync(serialSettings.CollapseRules, collapseFilter.Text);
             serialSettings.SendText = sendText.Text;
             serialSettings.ShowTime = showTimestamps.Checked;
-            serialSettings.AutoScroll = follow.Checked;
             serialSettings.HexDisplay = hexDisplay.Checked;
             serialSettings.HexSend = hexSend.Checked;
             serialSettings.LineEnding = SelectedEnding;
@@ -430,6 +427,8 @@ namespace SerialCom
                 connectionEncoding = serialSettings.TextEncoding;
                 receiveDecoder = connectionEncoding.GetDecoder();
                 serial = next;
+                follow.Checked = true;
+                ScrollToEnd();
                 poll.Start();
                 SetStatus("已连接  " + name + "  ·  " + baudRate + "  ·  " + serialSettings.DataBits +
                     ParityLabel(serialSettings.Parity) + StopBitsLabel(serialSettings.StopBits) +
@@ -928,7 +927,7 @@ namespace SerialCom
         public StopBits StopBits { get; set; }
         public Handshake Handshake { get; set; }
         public string FilterText = "", CollapseText = "", SendText = "", PortName = "";
-        public bool ShowTime = true, AutoScroll = true, Maximized, HexDisplay, HexSend;
+        public bool ShowTime = true, Maximized, HexDisplay, HexSend;
         public int CurrentBaud, WindowWidth = 1060, WindowHeight = 710;
         public List<SentCommand> SendHistory = new List<SentCommand>();
         public List<KeywordRule> FilterRules = new List<KeywordRule>(), CollapseRules = new List<KeywordRule>();
@@ -1044,7 +1043,6 @@ namespace SerialCom
                     }
                     else if (key == "port") settings.PortName = Decode(line.Substring(separator + 1));
                     else if (key == "showTime" && bool.TryParse(value, out flag)) settings.ShowTime = flag;
-                    else if (key == "autoScroll" && bool.TryParse(value, out flag)) settings.AutoScroll = flag;
                     else if (key == "hexDisplay" && bool.TryParse(value, out flag)) settings.HexDisplay = flag;
                     else if (key == "hexSend" && bool.TryParse(value, out flag)) settings.HexSend = flag;
                     else if (key == "maximized" && bool.TryParse(value, out flag)) settings.Maximized = flag;
@@ -1104,7 +1102,6 @@ namespace SerialCom
                 "collapse=" + Encode(CollapseText),
                 "send=" + Encode(SendText),
                 "showTime=" + ShowTime,
-                "autoScroll=" + AutoScroll,
                 "hexDisplay=" + HexDisplay,
                 "hexSend=" + HexSend,
                 "sendEnding=" + LineEnding,
@@ -1147,7 +1144,7 @@ namespace SerialCom
             FilterRules = other.FilterRules.Select(rule => new KeywordRule(rule.Text, rule.Enabled)).ToList();
             CollapseRules = other.CollapseRules.Select(rule => new KeywordRule(rule.Text, rule.Enabled)).ToList();
             SendText = other.SendText; PortName = other.PortName;
-            ShowTime = other.ShowTime; AutoScroll = other.AutoScroll;
+            ShowTime = other.ShowTime;
             HexDisplay = other.HexDisplay; HexSend = other.HexSend;
             LineEnding = other.LineEnding;
             SendHistory = new List<SentCommand>(other.SendHistory);
