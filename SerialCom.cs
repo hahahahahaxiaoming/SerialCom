@@ -13,6 +13,9 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyTitle("SerialCom")]
 [assembly: System.Reflection.AssemblyProduct("SerialCom")]
 [assembly: System.Reflection.AssemblyDescription("SerialCom 串口助手")]
+[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("V1.0")]
 
 namespace SerialCom
 {
@@ -62,7 +65,11 @@ namespace SerialCom
         readonly Timer saveDelay = new Timer { Interval = 400 };
         readonly LogHistory history = new LogHistory();
         readonly LogHistory hexHistory = new LogHistory();
-        readonly Decoder receiveDecoder = Encoding.UTF8.GetDecoder();
+        Decoder receiveDecoder = Encoding.UTF8.GetDecoder();
+        Encoding connectionEncoding = Encoding.UTF8;
+        Encoding TextEncoding { get { return serial == null ? serialSettings.TextEncoding : connectionEncoding; } }
+        readonly SessionLogArchive archive = new SessionLogArchive(StoragePaths.Root, () => DateTime.Now);
+        string archiveError;
         LogHistory ViewHistory { get { return hexDisplay.Checked ? hexHistory : history; } }
         readonly SerialSettings serialSettings = SerialSettings.Load();
         SerialPort serial;
@@ -70,7 +77,8 @@ namespace SerialCom
         bool statusError, changingSendMode;
         public MonitorWindow()
         {
-            Text = "SerialCom";
+            ApplyCacheBudget();
+            Text = "SerialCom " + Application.ProductVersion;
             StartPosition = FormStartPosition.CenterScreen;
             AutoScaleMode = AutoScaleMode.Dpi;
             Font = new Font("Microsoft YaHei UI", 10);
@@ -111,7 +119,7 @@ namespace SerialCom
             hints.SetToolTip(hexSend, "按原始字节发送。示例：01 02 FF 或 0102FF；结束符由右侧下拉框决定。");
             hints.SetToolTip(sendEnding, "不追加：不发送结束符；回车：0D；换行：0A；回车换行：0D 0A；换行回车：0A 0D。文本与 HEX 模式均适用。");
             hints.SetToolTip(hexDisplay, "显示原始收发字节，每行最多 16 字节，保留 00、回车和换行等字节。");
-            hints.SetToolTip(sendInput, "文本模式使用 UTF-8；HEX 模式按字节发送。结束符由发送按钮左侧下拉框决定。");
+            hints.SetToolTip(sendInput, "文本模式使用串口设置中的编码（UTF-8 / GBK）；HEX 模式按字节发送。连接期间修改编码在下次连接生效。");
 
             var console = new LogCard { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 12), Padding = new Padding(16, 8, 16, 8) };
             var body = new TableLayoutPanel { Dock = DockStyle.Fill, Margin = Padding.Empty, BackColor = Palette.Surface, ColumnCount = 1, RowCount = 4 };
@@ -181,7 +189,7 @@ namespace SerialCom
             poll.Tick += (s, e) => ReadPort();
             saveDelay.Tick += (s, e) => SaveView();
             FormClosing += (s, e) => { ClosePort("已断开"); SaveView(); };
-            FormClosed += (s, e) => { saveDelay.Dispose(); poll.Dispose(); hints.Dispose(); logMenu.Dispose(); };
+            FormClosed += (s, e) => { archive.Dispose(); saveDelay.Dispose(); poll.Dispose(); hints.Dispose(); logMenu.Dispose(); };
             ScanPorts();
             UpdateCount();
             filter.TextChanged += QueueSave;
@@ -197,6 +205,8 @@ namespace SerialCom
             baud.SelectedIndexChanged += QueueSave;
             SizeChanged += QueueSave;
             Shown += (s, e) => SaveView();
+            hints.SetToolTip(count, "RAM 档位为文本与 HEX 历史缓存的合计估算预算，各占一半；不含界面、临时对象及程序自身内存。原始日志持续保存，不设上限。\n" + StoragePaths.Root);
+            hints.SetToolTip(clear, "仅清空界面缓存，不删除本地原始日志。");
         }
 
         void QueueSave(object sender, EventArgs e) { saveDelay.Stop(); saveDelay.Start(); }
@@ -207,7 +217,7 @@ namespace SerialCom
         {
             if (changingSendMode) return;
             string converted, error;
-            if (SerialData.TryConvertInput(sendText.Text, hexSend.Checked, out converted, out error))
+            if (SerialData.TryConvertInput(sendText.Text, hexSend.Checked, TextEncoding, out converted, out error))
             {
                 sendText.Text = converted;
                 sendText.SelectionStart = sendText.TextLength;
@@ -368,7 +378,7 @@ namespace SerialCom
         {
             baud.Items.Clear();
             foreach (int rate in serialSettings.BaudPresets) baud.Items.Add(rate);
-            int selected = serialSettings.CurrentBaud > 0 ? serialSettings.CurrentBaud : serialSettings.BaudRate;
+            int selected = serialSettings.CurrentBaud;
             if (serialSettings.BaudPresets.Contains(selected))
                 baud.SelectedItem = selected;
             else if (baud.Items.Count > 0) baud.SelectedIndex = 0;
@@ -383,10 +393,12 @@ namespace SerialCom
                 {
                     CaptureView();
                     dialog.Settings.CopyViewFrom(serialSettings);
-                    dialog.Settings.CurrentBaud = dialog.Settings.BaudRate;
+                    dialog.Settings.NormalizeBaudSelection();
                     dialog.Settings.Save();
                     serialSettings.CopyFrom(dialog.Settings);
                     serialSettings.CurrentBaud = dialog.Settings.CurrentBaud;
+                    ApplyCacheBudget();
+                    RebuildView();
                 }
                 catch (Exception error)
                 {
@@ -406,18 +418,20 @@ namespace SerialCom
             string name = (string)ports.SelectedItem;
             var next = new SerialPort(name, baudRate, serialSettings.Parity, serialSettings.DataBits, serialSettings.StopBits)
             {
-                Encoding = Encoding.UTF8, Handshake = serialSettings.Handshake, DtrEnable = false, RtsEnable = false,
+                Encoding = serialSettings.TextEncoding, Handshake = serialSettings.Handshake, DtrEnable = false, RtsEnable = false,
                 ReadBufferSize = 65536
             };
             try
             {
                 next.Open();
-                receiveDecoder.Reset();
+                PrepareArchive();
+                connectionEncoding = serialSettings.TextEncoding;
+                receiveDecoder = connectionEncoding.GetDecoder();
                 serial = next;
                 poll.Start();
                 SetStatus("已连接  " + name + "  ·  " + baudRate + "  ·  " + serialSettings.DataBits +
                     ParityLabel(serialSettings.Parity) + StopBitsLabel(serialSettings.StopBits) +
-                    "  ·  " + HandshakeLabel(serialSettings.Handshake), false);
+                    "  ·  " + HandshakeLabel(serialSettings.Handshake) + "  ·  " + serialSettings.TextEncodingName, false);
             }
             catch (Exception error)
             {
@@ -461,7 +475,7 @@ namespace SerialCom
             if (string.IsNullOrWhiteSpace(text)) return;
             byte[] payload;
             string parseError;
-            if (!SerialData.TryBuildPayload(text, hexSend.Checked, SelectedEnding, out payload, out parseError))
+            if (!SerialData.TryBuildPayload(text, hexSend.Checked, SelectedEnding, TextEncoding, out payload, out parseError))
             {
                 SetStatus(parseError, true);
                 return;
@@ -519,6 +533,9 @@ namespace SerialCom
                 try { closing.Dispose(); }
                 catch (Exception closeError) { message += " " + closeError.Message; error = true; }
             }
+            try { archive.Dispose(); }
+            catch (Exception closeError) { archiveError = closeError.Message; message += " 日志关闭失败：" + closeError.Message; error = true; }
+            UpdateCount();
             SetStatus(message, error);
             UpdateControls();
         }
@@ -530,8 +547,9 @@ namespace SerialCom
 
         void ReceiveBytes(byte[] bytes)
         {
+            SaveRaw(bytes);
             RecordHex(bytes, "->");
-            char[] chars = new char[Encoding.UTF8.GetMaxCharCount(bytes.Length)];
+            char[] chars = new char[connectionEncoding.GetMaxCharCount(bytes.Length)];
             int decoded = receiveDecoder.GetChars(bytes, 0, bytes.Length, chars, 0, false);
             if (decoded > 0) Receive(new string(chars, 0, decoded));
         }
@@ -638,7 +656,91 @@ namespace SerialCom
         void UpdateCount()
         {
             count.Text = "显示 " + (matchCount - hiddenMatches).ToString("N0") + " / 筛选后 " + matchCount.ToString("N0") +
-                " / 保留 " + ViewHistory.Count.ToString("N0") + " 行";
+                " / 缓存 " + ViewHistory.Count.ToString("N0") + " 行 · RAM≈" +
+                ((history.EstimatedBytes + hexHistory.EstimatedBytes) / 1048576.0).ToString("F1") + "/" + serialSettings.LogRamMB + " MB · " +
+                (archiveError == null ? "原始日志自动保存（无上限）" : "日志保存失败：" + archiveError);
+            count.ForeColor = archiveError == null ? Muted : Palette.Error;
+        }
+
+        void PrepareArchive()
+        {
+            try { archive.StartSession(); archiveError = null; UpdateCount(); }
+            catch (Exception error) { throw ArchiveFailure(error); }
+        }
+
+        void SaveRaw(byte[] bytes)
+        {
+            try { archive.Write(bytes); }
+            catch (Exception error) { throw ArchiveFailure(error); }
+        }
+
+        IOException ArchiveFailure(Exception error)
+        {
+            archiveError = error.Message;
+            UpdateCount();
+            return new IOException("原始日志保存失败，已停止通信，请检查磁盘空间和目录权限：" + error.Message, error);
+        }
+
+        void ApplyCacheBudget()
+        {
+            long perHistory = serialSettings.LogRamMB * 1048576L / 2;
+            history.SetBudget(perHistory);
+            hexHistory.SetBudget(perHistory);
+        }
+    }
+
+    static class StoragePaths
+    {
+        internal static readonly string Root = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "SerialCom");
+    }
+
+    // Each successful port connection fixes its folder and files until disconnect.
+    // Persist raw bytes independently of display decoding, filtering or trimming.
+    sealed class SessionLogArchive : IDisposable
+    {
+        readonly string root;
+        readonly Func<DateTime> clock;
+        FileStream received;
+
+        internal SessionLogArchive(string root, Func<DateTime> clock)
+        {
+            this.root = root;
+            this.clock = clock;
+        }
+
+        internal void StartSession()
+        {
+            Dispose();
+            DateTime opened = clock();
+            string session = opened.ToString("HHmmss", System.Globalization.CultureInfo.InvariantCulture);
+            string folder = Path.Combine(root, opened.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture));
+            Directory.CreateDirectory(folder);
+            try
+            {
+                received = Open(Path.Combine(folder, session + ".log"));
+            }
+            catch { Dispose(); throw; }
+        }
+
+        static FileStream Open(string path)
+        {
+            return new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
+        }
+
+        internal void Write(byte[] bytes)
+        {
+            if (received == null) throw new IOException("日志会话尚未打开。");
+            received.Write(bytes, 0, bytes.Length);
+            // Flush each received batch, including incomplete lines, to disk.
+            received.Flush(true);
+        }
+
+        public void Dispose()
+        {
+            FileStream rx = received;
+            received = null;
+            if (rx != null) rx.Dispose();
         }
     }
 
@@ -684,6 +786,11 @@ namespace SerialCom
 
         public static bool TryBuildPayload(string text, bool hex, SendEnding ending, out byte[] bytes, out string error)
         {
+            return TryBuildPayload(text, hex, ending, Encoding.UTF8, out bytes, out error);
+        }
+
+        public static bool TryBuildPayload(string text, bool hex, SendEnding ending, Encoding encoding, out byte[] bytes, out string error)
+        {
             error = null;
             bytes = null;
             if (!Enum.IsDefined(typeof(SendEnding), ending)) { error = "请选择有效的发送结束符。"; return false; }
@@ -691,7 +798,11 @@ namespace SerialCom
             {
                 if (!TryBuildPayload(text, true, out bytes, out error)) return false;
             }
-            else bytes = Encoding.UTF8.GetBytes(text);
+            else
+            {
+                try { bytes = StrictEncoding(encoding).GetBytes(text); }
+                catch (EncoderFallbackException) { error = "内容包含当前编码无法表示的字符，请更换编码或修改内容。"; return false; }
+            }
             int length = bytes.Length;
             if (ending != SendEnding.None)
             {
@@ -705,15 +816,31 @@ namespace SerialCom
 
         public static bool TryConvertInput(string text, bool toHex, out string converted, out string error)
         {
+            return TryConvertInput(text, toHex, Encoding.UTF8, out converted, out error);
+        }
+
+        static Encoding StrictEncoding(Encoding encoding)
+        {
+            return Encoding.GetEncoding(encoding.CodePage, EncoderFallback.ExceptionFallback, DecoderFallback.ExceptionFallback);
+        }
+
+        public static bool TryConvertInput(string text, bool toHex, Encoding encoding, out string converted, out string error)
+        {
             converted = text;
             error = null;
             if (text.Length == 0) return true;
-            if (toHex) { converted = ToHex(Encoding.UTF8.GetBytes(text)); return true; }
+            if (toHex)
+            {
+                byte[] encoded;
+                if (!TryBuildPayload(text, false, SendEnding.None, encoding, out encoded, out error)) return false;
+                converted = ToHex(encoded);
+                return true;
+            }
             byte[] bytes;
             if (!TryBuildPayload(text, true, out bytes, out error)) return false;
             try
             {
-                string decoded = new UTF8Encoding(false, true).GetString(bytes);
+                string decoded = StrictEncoding(encoding).GetString(bytes);
                 if (decoded.Any(char.IsControl))
                 {
                     error = "内容含有换行或不可显示的控制字节，已保持 HEX 模式，避免内容丢失。";
@@ -724,7 +851,7 @@ namespace SerialCom
             }
             catch (DecoderFallbackException)
             {
-                error = "这些字节不是有效的 UTF-8 文本，已保持 HEX 模式，避免内容丢失。";
+                error = "这些字节不是当前编码的有效文本，已保持 HEX 模式，避免内容丢失。";
                 return false;
             }
         }
@@ -771,13 +898,17 @@ namespace SerialCom
 
     sealed class SerialSettings
     {
-        internal static readonly string SettingsFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "SerialCom.ini");
+        internal static readonly int[] LogRamChoices = { 8, 16, 32, 64, 128, 256 };
+        public int LogRamMB = 16;
+        public string TextEncodingName = "UTF-8";
+        public Encoding TextEncoding { get { return TextEncodingName == "GBK" ? Encoding.GetEncoding(936) : Encoding.UTF8; } }
+        internal static readonly string SettingsFile = Path.Combine(StoragePaths.Root, "SerialCom.ini");
+        static readonly string PortableSettingsFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "SerialCom.ini");
         static readonly string PreviousSettingsFile = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "SerialLog.ini");
         static readonly string LegacySettingsFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "KuyiSerialLog", "serial.txt");
         static readonly int[] DefaultRates = { 9600, 115200, 460800, 921600, 1000000, 2000000, 3000000 };
         static readonly int[] PreviousDefaultRates = { 110, 150, 300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 256000, 460800, 576000, 921600, 1000000, 2000000, 3000000 };
 
-        public int BaudRate { get; set; }
         public List<int> BaudPresets { get; set; }
         public Parity Parity { get; set; }
         public int DataBits { get; set; }
@@ -808,7 +939,7 @@ namespace SerialCom
         {
             return new SerialSettings
             {
-                BaudRate = 921600,
+                CurrentBaud = 921600,
                 BaudPresets = new List<int>(DefaultRates),
                 Parity = Parity.None,
                 DataBits = 8,
@@ -817,13 +948,16 @@ namespace SerialCom
             };
         }
 
-        public static SerialSettings Load()
+        public static SerialSettings Load(string source = null)
         {
             SerialSettings settings = Defaults();
             bool endingLoaded = false;
+            bool currentBaudLoaded = false;
+            int legacyBaud = settings.CurrentBaud;
             try
             {
-                string source = File.Exists(SettingsFile) ? SettingsFile :
+                if (source == null) source = File.Exists(SettingsFile) ? SettingsFile :
+                    File.Exists(PortableSettingsFile) ? PortableSettingsFile :
                     File.Exists(PreviousSettingsFile) ? PreviousSettingsFile : LegacySettingsFile;
                 foreach (string line in File.ReadAllLines(source, Encoding.UTF8))
                 {
@@ -833,13 +967,15 @@ namespace SerialCom
                     string value = line.Substring(separator + 1).Trim();
                     int number;
                     bool flag;
-                    if (key == "baud" && int.TryParse(value, out number) && number > 0) settings.BaudRate = number;
+                    if (key == "baud" && int.TryParse(value, out number) && number > 0) legacyBaud = number;
                     else if (key == "presets")
                     {
                         List<int> parsed = ParseRates(value);
                         if (parsed.Count > 0) settings.BaudPresets = parsed;
                     }
                     else if (key == "dataBits" && int.TryParse(value, out number) && number >= 5 && number <= 8) settings.DataBits = number;
+                    else if (key == "logRamMB" && int.TryParse(value, out number) && LogRamChoices.Contains(number)) settings.LogRamMB = number;
+                    else if (key == "textEncoding" && (value == "UTF-8" || value == "GBK")) settings.TextEncodingName = value;
                     else if (key == "parity")
                     {
                         Parity parsed;
@@ -899,7 +1035,7 @@ namespace SerialCom
                     else if (key == "hexDisplay" && bool.TryParse(value, out flag)) settings.HexDisplay = flag;
                     else if (key == "hexSend" && bool.TryParse(value, out flag)) settings.HexSend = flag;
                     else if (key == "maximized" && bool.TryParse(value, out flag)) settings.Maximized = flag;
-                    else if (key == "currentBaud" && int.TryParse(value, out number) && number > 0) settings.CurrentBaud = number;
+                    else if (key == "currentBaud" && int.TryParse(value, out number) && number > 0) { settings.CurrentBaud = number; currentBaudLoaded = true; }
                     else if (key == "windowWidth" && int.TryParse(value, out number) && number >= 854 && number <= 10000) settings.WindowWidth = number;
                     else if (key == "windowHeight" && int.TryParse(value, out number) && number >= 461 && number <= 10000) settings.WindowHeight = number;
                 }
@@ -914,14 +1050,20 @@ namespace SerialCom
             else settings.CollapseText = KeywordRules.Expression(settings.CollapseRules);
             if (settings.BaudPresets.SequenceEqual(PreviousDefaultRates))
                 settings.BaudPresets = new List<int>(DefaultRates);
-            if (!settings.BaudPresets.Contains(settings.BaudRate))
-                settings.BaudPresets.Insert(0, settings.BaudRate);
-            if (!settings.BaudPresets.Contains(settings.CurrentBaud)) settings.CurrentBaud = settings.BaudRate;
+            if (!currentBaudLoaded) settings.CurrentBaud = legacyBaud;
+            if (!settings.BaudPresets.Contains(settings.CurrentBaud))
+                settings.BaudPresets.Insert(0, settings.CurrentBaud);
             return settings;
+        }
+
+        public void NormalizeBaudSelection()
+        {
+            if (!BaudPresets.Contains(CurrentBaud)) CurrentBaud = BaudPresets[0];
         }
 
         public void Save()
         {
+            Directory.CreateDirectory(StoragePaths.Root);
             string temporary = SettingsFile + "." + Guid.NewGuid().ToString("N") + ".tmp";
             try
             {
@@ -936,7 +1078,8 @@ namespace SerialCom
         {
             return string.Join("\n", new[]
                 {
-                "baud=" + BaudRate,
+                "logRamMB=" + LogRamMB,
+                "textEncoding=" + TextEncodingName,
                 "presets=" + string.Join(",", BaudPresets),
                 "parity=" + Parity,
                 "dataBits=" + DataBits,
@@ -1001,7 +1144,8 @@ namespace SerialCom
 
         public void CopyFrom(SerialSettings other)
         {
-            BaudRate = other.BaudRate;
+            LogRamMB = other.LogRamMB;
+            TextEncodingName = other.TextEncodingName;
             BaudPresets = new List<int>(other.BaudPresets);
             Parity = other.Parity;
             DataBits = other.DataBits;
@@ -1030,11 +1174,12 @@ namespace SerialCom
     sealed class SerialSettingsDialog : Form
     {
         readonly TextBox presetsText = new TextBox { BorderStyle = BorderStyle.None, Dock = DockStyle.Fill };
-        readonly ComboBox defaultBaud = new ThemeCombo();
         readonly ComboBox parity = new ThemeCombo();
         readonly ComboBox dataBits = new ThemeCombo();
         readonly ComboBox stopBits = new ThemeCombo();
         readonly ComboBox handshake = new ThemeCombo();
+        readonly ComboBox logRam = new ThemeCombo { AccessibleName = "日志 RAM 缓存" };
+        readonly ComboBox textEncoding = new ThemeCombo { AccessibleName = "编码方式" };
         public SerialSettings Settings { get; private set; }
 
         public SerialSettingsDialog(SerialSettings current)
@@ -1048,19 +1193,19 @@ namespace SerialCom
             Font = new Font("Microsoft YaHei UI", 10);
             BackColor = Palette.Canvas;
             ForeColor = Palette.Ink;
-            ClientSize = new Size(460, 390);
+            ClientSize = new Size(520, 528);
 
-            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(20, 16, 20, 14), ColumnCount = 2, RowCount = 7 };
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(20, 16, 20, 14), ColumnCount = 2, RowCount = 9 };
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 115));
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            for (int i = 0; i < 6; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+            for (int i = 0; i < 7; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 92));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
             presetsText.Text = string.Join(", ", current.BaudPresets);
             presetsText.AccessibleName = "波特率预设，以逗号分隔";
             var presetInput = new ThemeInput(presetsText) { Dock = DockStyle.Fill, Margin = new Padding(0, 4, 0, 4) };
             AddRow(layout, 0, "波特率预设", presetInput);
-            AddRow(layout, 1, "默认波特率", defaultBaud);
 
             parity.Items.AddRange(new object[] { "无 (None)", "奇 (Odd)", "偶 (Even)", "标记 (Mark)", "空格 (Space)" });
             parity.SelectedIndex = (int)current.Parity;
@@ -1070,23 +1215,30 @@ namespace SerialCom
             stopBits.SelectedIndex = current.StopBits == StopBits.One ? 0 : current.StopBits == StopBits.OnePointFive ? 1 : 2;
             handshake.Items.AddRange(new object[] { "无 (None)", "软件 (XON/XOFF)", "硬件 (RTS/CTS)", "硬件 + 软件" });
             handshake.SelectedIndex = (int)current.Handshake;
-            AddRow(layout, 2, "奇偶校验", parity);
-            AddRow(layout, 3, "数据位", dataBits);
-            AddRow(layout, 4, "停止位", stopBits);
-            AddRow(layout, 5, "流控", handshake);
+            AddRow(layout, 1, "奇偶校验", parity);
+            AddRow(layout, 2, "数据位", dataBits);
+            AddRow(layout, 3, "停止位", stopBits);
+            AddRow(layout, 4, "流控", handshake);
+            foreach (int mb in SerialSettings.LogRamChoices) logRam.Items.Add(mb + " MB" + (mb == 16 ? "（默认）" : ""));
+            logRam.SelectedIndex = Array.IndexOf(SerialSettings.LogRamChoices, current.LogRamMB);
+            AddRow(layout, 5, "日志 RAM", logRam);
+            textEncoding.Items.AddRange(new object[] { "UTF-8", "GBK" });
+            textEncoding.SelectedItem = current.TextEncodingName;
+            AddRow(layout, 6, "编码方式", textEncoding);
+            var cacheNote = new Label { Dock = DockStyle.Fill, Text = "RAM 为文本与 HEX 缓存合计估算预算，各占一半；不含程序及界面内存，保存后立即生效。原始日志不受 RAM 限制。\n编码需与设备一致，用于文本收发及读取原始日志。\n连接期间修改编码，下次连接生效。", AutoSize = false };
+            layout.Controls.Add(cacheNote, 0, 7);
+            layout.SetColumnSpan(cacheNote, 2);
 
             var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, Padding = new Padding(0, 7, 0, 0) };
             var save = new LogButton("保存", true) { Width = 84 };
             var cancel = new LogButton("取消", false) { Width = 84, DialogResult = DialogResult.Cancel };
             buttons.Controls.Add(cancel);
             buttons.Controls.Add(save);
-            layout.Controls.Add(buttons, 0, 6);
+            layout.Controls.Add(buttons, 0, 8);
             layout.SetColumnSpan(buttons, 2);
             Controls.Add(layout);
             MonitorWindow.ApplyColors(this, Palette.Canvas);
 
-            presetsText.TextChanged += (s, e) => UpdateDefaultBaud(current.BaudRate);
-            UpdateDefaultBaud(current.BaudRate);
             save.Click += (s, e) => SaveSettings();
             AcceptButton = save;
             CancelButton = cancel;
@@ -1108,21 +1260,10 @@ namespace SerialCom
             layout.Controls.Add(control, 1, row);
         }
 
-        void UpdateDefaultBaud(int preferred)
-        {
-            List<int> rates = SerialSettings.ParseRates(presetsText.Text);
-            object selected = defaultBaud.SelectedItem;
-            defaultBaud.Items.Clear();
-            foreach (int rate in rates) defaultBaud.Items.Add(rate);
-            if (selected != null && rates.Contains((int)selected)) defaultBaud.SelectedItem = selected;
-            else if (rates.Contains(preferred)) defaultBaud.SelectedItem = preferred;
-            else if (defaultBaud.Items.Count > 0) defaultBaud.SelectedIndex = 0;
-        }
-
         void SaveSettings()
         {
             List<int> rates = SerialSettings.ParseRates(presetsText.Text);
-            if (rates.Count == 0 || defaultBaud.SelectedItem == null)
+            if (rates.Count == 0)
             {
                 MessageBox.Show(this, "请输入至少一个有效的正整数波特率，用逗号分隔。", "波特率预设无效",
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -1131,11 +1272,12 @@ namespace SerialCom
             Settings = new SerialSettings
             {
                 BaudPresets = rates,
-                BaudRate = (int)defaultBaud.SelectedItem,
                 Parity = (Parity)parity.SelectedIndex,
                 DataBits = (int)dataBits.SelectedItem,
                 StopBits = stopBits.SelectedIndex == 0 ? StopBits.One : stopBits.SelectedIndex == 1 ? StopBits.OnePointFive : StopBits.Two,
-                Handshake = (Handshake)handshake.SelectedIndex
+                Handshake = (Handshake)handshake.SelectedIndex,
+                LogRamMB = SerialSettings.LogRamChoices[logRam.SelectedIndex],
+                TextEncodingName = (string)textEncoding.SelectedItem
             };
             DialogResult = DialogResult.OK;
             Close();
@@ -1282,13 +1424,35 @@ namespace SerialCom
     sealed class LogHistory
     {
         const int LineLimit = 8000;
-        const int HistoryLimit = 20000;
-        const int CharacterLimit = 2000000;
+        long budget = 8 * 1048576L;
         static readonly Regex Ansi = new Regex(@"\x1B\[[0-?]*[ -/]*[@-~]");
         readonly Queue<LogLine> lines = new Queue<LogLine>();
         readonly StringBuilder pending = new StringBuilder();
         bool truncated;
-        int characters;
+        long estimatedBytes;
+        public long EstimatedBytes { get { return estimatedBytes; } }
+
+        // Conservative allowance for a LogLine, its UTF-16 string, alignment and
+        // queue references. This is a cache estimate, not a process working-set cap.
+        static long Cost(LogLine line) { return 96L + ((line.Text.Length * 2L + 7) / 8 * 8); }
+
+        public void SetBudget(long bytes)
+        {
+            if (bytes <= 0) throw new ArgumentOutOfRangeException("bytes");
+            budget = bytes;
+            Trim(line => { });
+            lines.TrimExcess();
+        }
+
+        void Trim(Action<LogLine> evicted)
+        {
+            while (estimatedBytes > budget && lines.Count > 0)
+            {
+                LogLine removed = lines.Dequeue();
+                estimatedBytes -= Cost(removed);
+                evicted(removed);
+            }
+        }
 
         public int Count { get { return lines.Count; } }
         public IEnumerable<LogLine> Lines { get { return lines; } }
@@ -1321,22 +1485,18 @@ namespace SerialCom
         public void Add(LogLine line, Action<LogLine> added, Action<LogLine> evicted)
         {
             lines.Enqueue(line);
-            characters += line.Text.Length;
-            while (lines.Count > HistoryLimit || characters > CharacterLimit)
-            {
-                LogLine removed = lines.Dequeue();
-                characters -= removed.Text.Length;
-                evicted(removed);
-            }
+            estimatedBytes += Cost(line);
             added(line);
+            Trim(evicted);
         }
 
         public void Clear()
         {
             lines.Clear();
+            lines.TrimExcess();
             pending.Clear();
             truncated = false;
-            characters = 0;
+            estimatedBytes = 0;
         }
 
         public static bool Matches(string line, string filter)
