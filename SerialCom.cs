@@ -46,10 +46,9 @@ namespace SerialCom
         readonly LogButton refresh = new LogButton("刷新串口", false);
         readonly LogButton settingsButton = new LogButton("串口设置", false);
         readonly LogButton send = new LogButton("发送", true);
-        readonly LogButton clear = new LogButton("清空日志", false);
         readonly CheckBox showTimestamps = new ThemeCheck { Text = "显示时间", Size = new Size(92, 34), Checked = true, Margin = new Padding(10, 0, 4, 0) };
         readonly CheckBox follow = new ThemeCheck { Text = "自动滚动", Size = new Size(104, 34), Checked = true, Margin = new Padding(10, 0, 4, 0) };
-        readonly CheckBox hexDisplay = new ThemeCheck { Text = "HEX 发送", Size = new Size(100, 34) };
+        readonly CheckBox hexDisplay = new ThemeCheck { Text = "HEX 显示", Size = new Size(100, 34) };
         readonly CheckBox hexSend = new ThemeCheck { Text = "HEX", Size = new Size(62, 34), AccessibleName = "HEX 发送" };
         readonly ComboBox sendEnding = new ThemeCombo { Width = 118, AccessibleName = "发送结束符", FlatStyle = FlatStyle.Flat };
         static readonly SendEnding[] EndingChoices = { SendEnding.None, SendEnding.CR, SendEnding.LF, SendEnding.CRLF, SendEnding.LFCR };
@@ -136,7 +135,10 @@ namespace SerialCom
 
             string selectedLogText = "";
             var copyLog = new ToolStripMenuItem("复制") { ShortcutKeyDisplayString = "Ctrl+C" };
+            var clearLog = new ToolStripMenuItem("清空日志") { ToolTipText = "仅清空界面缓存，不删除本地原始日志。" };
             logMenu.Items.Add(copyLog);
+            logMenu.Items.Add(clearLog);
+            clearLog.Click += (s, e) => { history.Clear(); hexHistory.Clear(); receiveDecoder.Reset(); RebuildView(); };
             logMenu.Opening += (s, e) =>
             {
                 selectedLogText = output.SelectedText;
@@ -150,7 +152,7 @@ namespace SerialCom
             };
             output.ContextMenuStrip = logMenu;
             output.Font = new Font("Consolas", 11);
-            body.Controls.Add(ToolbarRow(filterInput, collapseInput, hexDisplay, showTimestamps, follow, clear), 0, 0);
+            body.Controls.Add(ToolbarRow(filterInput, collapseInput, hexDisplay, showTimestamps, follow), 0, 0);
             body.Controls.Add(status, 0, 1);
             body.Controls.Add(output, 0, 2);
             body.Controls.Add(count, 0, 3);
@@ -178,7 +180,6 @@ namespace SerialCom
             collapseFilter.TextChanged += (s, e) => RebuildView();
             showTimestamps.CheckedChanged += (s, e) => RebuildView();
             hexDisplay.CheckedChanged += (s, e) => RebuildView();
-            clear.Click += (s, e) => { history.Clear(); hexHistory.Clear(); receiveDecoder.Reset(); RebuildView(); };
             follow.CheckedChanged += (s, e) => { if (follow.Checked) ScrollToEnd(); };
             output.ScrolledAway += (s, e) =>
             {
@@ -206,7 +207,6 @@ namespace SerialCom
             SizeChanged += QueueSave;
             Shown += (s, e) => SaveView();
             hints.SetToolTip(count, "RAM 档位为文本与 HEX 历史缓存的合计估算预算，各占一半；不含界面、临时对象及程序自身内存。原始日志持续保存，不设上限。\n" + StoragePaths.Root);
-            hints.SetToolTip(clear, "仅清空界面缓存，不删除本地原始日志。");
         }
 
         void QueueSave(object sender, EventArgs e) { saveDelay.Stop(); saveDelay.Start(); }
