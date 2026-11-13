@@ -73,6 +73,8 @@ namespace SerialCom
         readonly SerialSettings serialSettings = SerialSettings.Load();
         SerialPort serial;
         int matchCount, hiddenMatches;
+        int pausedDisplayCount;
+        bool viewDirty;
         bool statusError, changingSendMode;
         public MonitorWindow()
         {
@@ -180,13 +182,13 @@ namespace SerialCom
             collapseFilter.TextChanged += (s, e) => RebuildView();
             showTimestamps.CheckedChanged += (s, e) => RebuildView();
             hexDisplay.CheckedChanged += (s, e) => RebuildView();
-            follow.CheckedChanged += (s, e) => { if (follow.Checked) ScrollToEnd(); };
-            output.ScrolledAway += (s, e) =>
+            follow.CheckedChanged += (s, e) =>
             {
-                if (follow.Checked) follow.Checked = false;
+                if (!follow.Checked) return;
+                if (viewDirty) RebuildView();
+                else ScrollToEnd();
             };
-            output.MouseWheel += (s, e) => output.CheckScrollPosition();
-            output.KeyUp += (s, e) => output.CheckScrollPosition();
+            output.UserScrolled += (s, e) => { follow.Checked = output.IsAtBottom; };
             poll.Tick += (s, e) => ReadPort();
             saveDelay.Tick += (s, e) => SaveView();
             FormClosing += (s, e) => { ClosePort("已断开"); SaveView(); };
@@ -571,6 +573,17 @@ namespace SerialCom
             var added = new StringBuilder();
             string[] query = KeywordRules.Parse(filter.Text);
             string[] collapse = KeywordRules.Parse(collapseFilter.Text);
+            if (!follow.Checked)
+            {
+                // Keep the displayed snapshot untouched while the user reads history.
+                // Reception, bounded history and disk logging continue independently.
+                if (!viewDirty) pausedDisplayCount = matchCount - hiddenMatches;
+                update(line => { if (PassesFilter(line.Text, query, collapse)) matchCount++; },
+                    line => { if (PassesFilter(line.Text, query, collapse)) matchCount--; });
+                viewDirty = true;
+                UpdateCount();
+                return;
+            }
             int evictedMatches = 0;
             update(line =>
             {
@@ -612,6 +625,7 @@ namespace SerialCom
                 first--;
             }
             hiddenMatches = first;
+            viewDirty = false;
             output.ReplaceLogText(first == matchCount ? "" : string.Join(Environment.NewLine, matching.Skip(first).Select(FormatLogLine)) + Environment.NewLine, follow.Checked);
             UpdateCount();
         }
@@ -633,8 +647,7 @@ namespace SerialCom
 
         void ScrollToEnd()
         {
-            output.Select(output.TextLength, 0);
-            output.ScrollToCaret();
+            output.ScrollToLogEnd();
         }
 
         void UpdateControls()
@@ -655,7 +668,7 @@ namespace SerialCom
 
         void UpdateCount()
         {
-            count.Text = "显示 " + (matchCount - hiddenMatches).ToString("N0") + " / 筛选后 " + matchCount.ToString("N0") +
+            count.Text = "显示 " + (viewDirty ? pausedDisplayCount : matchCount - hiddenMatches).ToString("N0") + " / 筛选后 " + matchCount.ToString("N0") +
                 " / 缓存 " + ViewHistory.Count.ToString("N0") + " 行 · RAM≈" +
                 ((history.EstimatedBytes + hexHistory.EstimatedBytes) / 1048576.0).ToString("F1") + "/" + serialSettings.LogRamMB + " MB · " +
                 (archiveError == null ? "原始日志自动保存（无上限）" : "日志保存失败：" + archiveError);
@@ -1293,7 +1306,20 @@ namespace SerialCom
         [DllImport("user32.dll")]
         static extern bool RedrawWindow(IntPtr hwnd, IntPtr updateRect, IntPtr updateRegion, uint flags);
 
-        public event EventHandler ScrolledAway;
+        [StructLayout(LayoutKind.Sequential)]
+        struct ScrollInfo
+        {
+            public uint Size, Mask;
+            public int Min, Max;
+            public uint Page;
+            public int Position, TrackPosition;
+        }
+        [DllImport("user32.dll")]
+        static extern bool GetScrollInfo(IntPtr hwnd, int bar, ref ScrollInfo info);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
+        static extern int GetWindowStyle(IntPtr hwnd, int index);
+
+        public event EventHandler UserScrolled;
         bool updating;
 
         public void AppendLogText(string text, bool followTail = true)
@@ -1310,6 +1336,19 @@ namespace SerialCom
         public void AppendPreservingView(string text)
         {
             AppendLogText(text, false);
+        }
+
+        public void ScrollToLogEnd()
+        {
+            bool wasUpdating = updating;
+            updating = true;
+            try
+            {
+                Select(TextLength, 0);
+                ScrollToCaret();
+                SendMessage(Handle, 0x0115, new IntPtr(7), IntPtr.Zero); // SB_BOTTOM
+            }
+            finally { updating = wasUpdating; }
         }
 
         void UpdateLog(string text, bool replace, bool followTail)
@@ -1354,6 +1393,7 @@ namespace SerialCom
                 if (suspendRedraw)
                 {
                     SendMessage(hwnd, 0x000B, new IntPtr(1), IntPtr.Zero);
+                    if (followTail) ScrollToLogEnd();
                     // Repaint content and scrollbars together, without erasing the background
                     // or forcing a synchronous paint between serial batches.
                     RedrawWindow(hwnd, IntPtr.Zero, IntPtr.Zero, 0x0001 | 0x0080 | 0x0400);
@@ -1364,26 +1404,22 @@ namespace SerialCom
 
         public void CheckScrollPosition()
         {
-            if (IsDisposed || !IsHandleCreated) return;
-            BeginInvoke((MethodInvoker)delegate
-            {
-                if (!IsDisposed && !IsAtBottom)
-                {
-                    EventHandler handler = ScrolledAway;
-                    if (handler != null) handler(this, EventArgs.Empty);
-                }
-            });
+            if (IsDisposed || !IsHandleCreated || updating) return;
+            EventHandler handler = UserScrolled;
+            if (handler != null) handler(this, EventArgs.Empty);
         }
 
-        bool IsAtBottom
+        public bool IsAtBottom
         {
             get
             {
-                if (TextLength == 0) return true;
-                int bottomChar = GetCharIndexFromPosition(new Point(Math.Max(2, ClientSize.Width - 4), Math.Max(0, ClientSize.Height - 2)));
-                int visibleLine = GetLineFromCharIndex(bottomChar);
-                int lastLine = GetLineFromCharIndex(TextLength);
-                return visibleLine >= lastLine - 1;
+                if (!IsHandleCreated || TextLength == 0) return true;
+                if ((GetWindowStyle(Handle, -16) & 0x00200000) == 0) return true; // No WS_VSCROLL.
+                var info = new ScrollInfo { Size = (uint)Marshal.SizeOf(typeof(ScrollInfo)), Mask = 0x0001 | 0x0002 | 0x0004 };
+                if (!GetScrollInfo(Handle, 1, ref info)) return false;
+                int bottom = Math.Max(info.Min, info.Max - (int)info.Page + 1);
+                // RichEdit can leave a few pixels of bottom padding after ScrollToCaret.
+                return info.Position >= bottom - 4;
             }
         }
 
@@ -1400,11 +1436,6 @@ namespace SerialCom
             if (scrollInput && !updating) CheckScrollPosition();
         }
 
-        protected override void OnMouseWheel(MouseEventArgs e)
-        {
-            base.OnMouseWheel(e);
-            CheckScrollPosition();
-        }
     }
 
     sealed class LogLine
