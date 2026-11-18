@@ -708,12 +708,14 @@ namespace SerialCom
     }
 
     // Each successful port connection fixes its folder and files until disconnect.
-    // Persist raw bytes independently of display decoding, filtering or trimming.
+    // Add line timestamps without decoding or filtering the received payload.
     sealed class SessionLogArchive : IDisposable
     {
         readonly string root;
         readonly Func<DateTime> clock;
         FileStream received;
+        bool atLineStart;
+        byte pendingNewline;
 
         internal SessionLogArchive(string root, Func<DateTime> clock)
         {
@@ -730,7 +732,24 @@ namespace SerialCom
             Directory.CreateDirectory(folder);
             try
             {
-                received = Open(Path.Combine(folder, session + ".log"));
+                string path = Path.Combine(folder, session + ".log");
+                received = Open(path);
+                // A reconnect in the same second must not join two partial lines.
+                if (received.Length > 0)
+                {
+                    using (var previous = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    {
+                        previous.Seek(-1, SeekOrigin.End);
+                        int last = previous.ReadByte();
+                        if (last != '\r' && last != '\n')
+                        {
+                            byte[] newline = Encoding.ASCII.GetBytes(Environment.NewLine);
+                            received.Write(newline, 0, newline.Length);
+                        }
+                    }
+                }
+                atLineStart = true;
+                pendingNewline = 0;
             }
             catch { Dispose(); throw; }
         }
@@ -743,7 +762,36 @@ namespace SerialCom
         internal void Write(byte[] bytes)
         {
             if (received == null) throw new IOException("日志会话尚未打开。");
-            received.Write(bytes, 0, bytes.Length);
+            byte[] prefix = null;
+            int start = 0;
+            for (int i = 0; i < bytes.Length; i++)
+            {
+                byte value = bytes[i];
+                bool newline = value == '\r' || value == '\n';
+                // Keep CRLF / LFCR together, even across separate reads.
+                if (pendingNewline != 0 && newline && value != pendingNewline)
+                {
+                    pendingNewline = 0;
+                    continue;
+                }
+                pendingNewline = 0;
+                if (atLineStart)
+                {
+                    if (i > start) received.Write(bytes, start, i - start);
+                    if (prefix == null)
+                        prefix = Encoding.ASCII.GetBytes("[" + clock().ToString("HH:mm:ss.fff",
+                            System.Globalization.CultureInfo.InvariantCulture) + "]-> ");
+                    received.Write(prefix, 0, prefix.Length);
+                    start = i;
+                    atLineStart = false;
+                }
+                if (newline)
+                {
+                    atLineStart = true;
+                    pendingNewline = value;
+                }
+            }
+            if (bytes.Length > start) received.Write(bytes, start, bytes.Length - start);
             // Flush each received batch, including incomplete lines, to disk.
             received.Flush(true);
         }
