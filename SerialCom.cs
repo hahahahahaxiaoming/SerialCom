@@ -9,6 +9,8 @@ using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Windows.Forms;
+using System.Diagnostics;
+using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("SerialCom")]
 [assembly: System.Reflection.AssemblyProduct("SerialCom")]
@@ -36,7 +38,7 @@ namespace SerialCom
         internal static Color Edge { get { return Palette.Edge; } }
         static Color Ink { get { return Palette.Ink; } }
         static Color Muted { get { return Palette.Muted; } }
-        const int DisplayLimit = 480000;
+        const int DisplayLimit = 120000;
         readonly ComboBox ports = new ThemeCombo { Width = 108 };
         readonly ComboBox baud = new ThemeCombo { Width = 112, AccessibleName = "波特率" };
         readonly TextBox filter = new TextBox { BorderStyle = BorderStyle.None, Width = 200, AccessibleName = "筛选内容" };
@@ -60,14 +62,17 @@ namespace SerialCom
         readonly LogOutput output = new LogOutput { Dock = DockStyle.Fill, ReadOnly = true,
             BorderStyle = BorderStyle.None, BackColor = Color.FromArgb(248, 250, 255), WordWrap = false,
             DetectUrls = false, HideSelection = false, ScrollBars = RichTextBoxScrollBars.Both };
-        readonly Timer poll = new Timer { Interval = 60 };
+        readonly Timer poll = new Timer { Interval = 100 };
+        readonly Timer filterDelay = new Timer { Interval = 250 };
         readonly Timer saveDelay = new Timer { Interval = 400 };
         readonly LogHistory history = new LogHistory();
         readonly LogHistory hexHistory = new LogHistory();
         Decoder receiveDecoder = Encoding.UTF8.GetDecoder();
         Encoding connectionEncoding = Encoding.UTF8;
         Encoding TextEncoding { get { return serial == null ? serialSettings.TextEncoding : connectionEncoding; } }
-        readonly SessionLogArchive archive = new SessionLogArchive(StoragePaths.Root, () => DateTime.Now);
+        SerialSession session;
+        bool closingWindow;
+        long skippedDisplayBytes;
         string archiveError;
         LogHistory ViewHistory { get { return hexDisplay.Checked ? hexHistory : history; } }
         readonly SerialSettings serialSettings = SerialSettings.Load();
@@ -76,8 +81,12 @@ namespace SerialCom
         int pausedDisplayCount;
         bool viewDirty;
         bool statusError, changingSendMode;
-        public MonitorWindow()
+        readonly bool persistSettings;
+        SerialSettingsDialog settingsDialog;
+        public MonitorWindow(bool persistSettings = true)
         {
+            this.persistSettings = persistSettings;
+            Palette.SetTheme(serialSettings.Theme);
             ApplyCacheBudget();
             Text = "SerialCom " + Application.ProductVersion;
             StartPosition = FormStartPosition.CenterScreen;
@@ -177,8 +186,9 @@ namespace SerialCom
                 }
             };
             ports.SelectedIndexChanged += (s, e) => UpdateControls();
-            filter.TextChanged += (s, e) => RebuildView();
-            collapseFilter.TextChanged += (s, e) => RebuildView();
+            filter.TextChanged += (s, e) => { filterDelay.Stop(); filterDelay.Start(); };
+            collapseFilter.TextChanged += (s, e) => { filterDelay.Stop(); filterDelay.Start(); };
+            filterDelay.Tick += (s, e) => { filterDelay.Stop(); RebuildView(); };
             showTimestamps.CheckedChanged += (s, e) => RebuildView();
             hexDisplay.CheckedChanged += (s, e) => RebuildView();
             follow.CheckedChanged += (s, e) =>
@@ -190,8 +200,12 @@ namespace SerialCom
             output.UserScrolled += (s, e) => { follow.Checked = output.IsAtBottom; };
             poll.Tick += (s, e) => ReadPort();
             saveDelay.Tick += (s, e) => SaveView();
-            FormClosing += (s, e) => { ClosePort("已断开"); SaveView(); };
-            FormClosed += (s, e) => { archive.Dispose(); saveDelay.Dispose(); poll.Dispose(); hints.Dispose(); logMenu.Dispose(); };
+            FormClosing += (s, e) =>
+            {
+                if (session != null) { closingWindow = true; e.Cancel = true; ClosePort("正在保存日志并断开…"); }
+                else SaveView();
+            };
+            FormClosed += (s, e) => { saveDelay.Dispose(); filterDelay.Dispose(); poll.Dispose(); hints.Dispose(); logMenu.Dispose(); };
             ScanPorts();
             UpdateCount();
             filter.TextChanged += QueueSave;
@@ -205,7 +219,7 @@ namespace SerialCom
             ports.SelectedIndexChanged += (s, e) => { if (ports.SelectedItem != null) QueueSave(s, e); };
             baud.SelectedIndexChanged += QueueSave;
             SizeChanged += QueueSave;
-            Shown += (s, e) => SaveView();
+            Shown += (s, e) => { ApplyTheme(); SaveView(); };
             hints.SetToolTip(count, "RAM 档位为文本与 HEX 历史缓存的合计估算预算，各占一半；不含界面、临时对象及程序自身内存。原始日志持续保存，不设上限。\n" + StoragePaths.Root);
         }
 
@@ -277,6 +291,7 @@ namespace SerialCom
         void SaveView()
         {
             saveDelay.Stop();
+            if (!persistSettings) return;
             CaptureView();
             try { serialSettings.Save(); }
             catch (Exception error) { SetStatus("配置保存失败：" + error.Message, true); }
@@ -290,9 +305,42 @@ namespace SerialCom
                     child is ThemeInput || child is TextBox || child is ComboBox || child is RichTextBox
                         ? Palette.Input : background;
                 child.BackColor = fill;
-                child.ForeColor = child is Label && child.Font.Size < 20 ? Muted : Ink;
+                var log = child as LogOutput;
+                if (log != null) log.ApplyInk(Ink);
+                else child.ForeColor = child is Label && child.Font.Size < 20 ? Muted : Ink;
                 ApplyColors(child, fill);
             }
+        }
+
+        string ActiveTheme { get { return settingsDialog == null ? serialSettings.Theme : settingsDialog.SelectedTheme; } }
+
+        void ApplyTheme()
+        {
+            Palette.SetTheme(ActiveTheme);
+            BackColor = Palette.Canvas;
+            ForeColor = Palette.Ink;
+            ApplyColors(this, Palette.Canvas);
+            logMenu.BackColor = Palette.Surface;
+            logMenu.ForeColor = Palette.Ink;
+            Palette.TitleBar(this);
+            SetStatus(status.Text, statusError);
+            UpdateCount();
+            if (settingsDialog != null) settingsDialog.ApplyTheme();
+            Invalidate(true);
+        }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            Palette.TitleBar(this);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            base.WndProc(ref m);
+            // WM_SETTINGCHANGE / WM_THEMECHANGED; no static event subscription to leak the form.
+            if ((m.Msg == 0x001A || m.Msg == 0x031A) && serialSettings != null && ActiveTheme == "System" && IsHandleCreated)
+                BeginInvoke((Action)(() => { if (!IsDisposed && ActiveTheme == "System") ApplyTheme(); }));
         }
 
         static Control Toolbar(params Control[] controls)
@@ -387,13 +435,15 @@ namespace SerialCom
         {
             using (var dialog = new SerialSettingsDialog(serialSettings))
             {
-                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                settingsDialog = dialog;
+                dialog.ThemeChanged += (s, e) => ApplyTheme();
                 try
                 {
+                    if (dialog.ShowDialog(this) != DialogResult.OK) return;
                     CaptureView();
                     dialog.Settings.CopyViewFrom(serialSettings);
                     dialog.Settings.NormalizeBaudSelection();
-                    dialog.Settings.Save();
+                    if (persistSettings) dialog.Settings.Save();
                     serialSettings.CopyFrom(dialog.Settings);
                     serialSettings.CurrentBaud = dialog.Settings.CurrentBaud;
                     ApplyCacheBudget();
@@ -404,6 +454,11 @@ namespace SerialCom
                     MessageBox.Show(this, "设置保存失败，程序不会重启：" + error.Message, "保存设置失败",
                         MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
+                }
+                finally
+                {
+                    settingsDialog = null;
+                    ApplyTheme();
                 }
             }
             PopulateBaudRates();
@@ -418,12 +473,14 @@ namespace SerialCom
             var next = new SerialPort(name, baudRate, serialSettings.Parity, serialSettings.DataBits, serialSettings.StopBits)
             {
                 Encoding = serialSettings.TextEncoding, Handshake = serialSettings.Handshake, DtrEnable = false, RtsEnable = false,
-                ReadBufferSize = 65536
+                ReadBufferSize = 65536, ReadTimeout = 100, WriteTimeout = 500
             };
             try
             {
                 next.Open();
-                PrepareArchive();
+                session = new SerialSession(next, StoragePaths.Root);
+                archiveError = null;
+                skippedDisplayBytes = 0;
                 connectionEncoding = serialSettings.TextEncoding;
                 receiveDecoder = connectionEncoding.GetDecoder();
                 serial = next;
@@ -489,10 +546,8 @@ namespace SerialCom
 
             try
             {
-                serial.Write(payload, 0, payload.Length);
+                session.Send(payload, hexSend.Checked ? "[HEX] " + SerialData.ToHex(payload) : text);
                 RememberSentCommand(text, hexSend.Checked);
-                AddSentLine(hexSend.Checked ? "[HEX] " + SerialData.ToHex(payload) : text);
-                RecordHex(payload, "<-");
             }
             catch (Exception error)
             {
@@ -508,35 +563,41 @@ namespace SerialCom
 
         void ReadPort()
         {
-            try
+            if (session == null) return;
+            long skipped;
+            SerialPacket packet = session.TakeDisplay(out skipped);
+            if (skipped > 0)
             {
-                int available = Math.Min(serial.BytesToRead, 65536);
-                if (available == 0) return;
-                byte[] bytes = new byte[available];
-                int read = serial.Read(bytes, 0, bytes.Length);
-                if (read != bytes.Length) Array.Resize(ref bytes, read);
-                ReceiveBytes(bytes);
+                skippedDisplayBytes += skipped;
+                receiveDecoder.Reset();
+                history.ResetPending();
             }
-            catch (Exception error) { ClosePort("串口读取中断。 " + error.Message, true); }
+            if (packet != null)
+            {
+                if (packet.SentText != null) { AddSentLine(packet.SentText); RecordHex(packet.Bytes, "<-"); }
+                else ReceiveBytes(packet.Bytes);
+            }
+            if (!session.Done) return;
+            // Drain the bounded display queue before completing a normal disconnect.
+            if (packet != null) return;
+            string error = session.Error;
+            session = null;
+            serial = null;
+            poll.Stop();
+            char[] remaining = new char[4];
+            int count = receiveDecoder.GetChars(new byte[0], 0, 0, remaining, 0, true);
+            if (count > 0) Receive(new string(remaining, 0, count));
+            Receive("\n");
+            archiveError = error;
+            SetStatus(error == null ? "已断开，日志已保存" : "通信已停止：" + error, error != null);
+            UpdateCount();
+            UpdateControls();
+            if (closingWindow) Close();
         }
 
         void ClosePort(string message, bool error = false)
         {
-            poll.Stop();
-            if (serial != null)
-            {
-                char[] remaining = new char[4];
-                int count = receiveDecoder.GetChars(new byte[0], 0, 0, remaining, 0, true);
-                if (count > 0) Receive(new string(remaining, 0, count));
-                Receive("\n");
-                SerialPort closing = serial;
-                serial = null;
-                try { closing.Dispose(); }
-                catch (Exception closeError) { message += " " + closeError.Message; error = true; }
-            }
-            try { archive.Dispose(); }
-            catch (Exception closeError) { archiveError = closeError.Message; message += " 日志关闭失败：" + closeError.Message; error = true; }
-            UpdateCount();
+            if (session != null) session.Stop(error ? message : null);
             SetStatus(message, error);
             UpdateControls();
         }
@@ -548,7 +609,6 @@ namespace SerialCom
 
         void ReceiveBytes(byte[] bytes)
         {
-            SaveRaw(bytes);
             RecordHex(bytes, "->");
             char[] chars = new char[connectionEncoding.GetMaxCharCount(bytes.Length)];
             int decoded = receiveDecoder.GetChars(bytes, 0, bytes.Length, chars, 0, false);
@@ -561,13 +621,14 @@ namespace SerialCom
             UpdateHistory(hexHistory, (added, removed) =>
             {
                 for (int offset = 0; offset < bytes.Length; offset += 16)
-                    hexHistory.Add(new LogLine(BitConverter.ToString(bytes, offset, Math.Min(16, bytes.Length - offset)).Replace('-', ' '),
+                    hexHistory.Add(new LogLine(bytes, offset, Math.Min(16, bytes.Length - offset),
                         timestamp, direction), added, removed);
             });
         }
 
         void UpdateHistory(LogHistory target, Action<Action<LogLine>, Action<LogLine>> update)
         {
+            if (filterDelay.Enabled) { update(line => { }, line => { }); return; }
             if (target != ViewHistory) { update(line => { }, line => { }); return; }
             var added = new StringBuilder();
             string[] query = KeywordRules.Parse(filter.Text);
@@ -592,40 +653,43 @@ namespace SerialCom
                     added.AppendLine(FormatLogLine(line));
                 }
             }, line => { if (PassesFilter(line.Text, query, collapse)) evictedMatches++; });
+            matchCount -= evictedMatches;
             if (evictedMatches > hiddenMatches)
             {
-                RebuildView();
+                RebuildView(false);
                 return;
             }
             hiddenMatches -= evictedMatches;
-            matchCount -= evictedMatches;
             if (output.TextLength + added.Length > DisplayLimit)
             {
-                RebuildView();
+                RebuildView(false);
                 return;
             }
             if (added.Length > 0) output.AppendLogText(added.ToString(), follow.Checked && output.SelectionLength == 0);
             UpdateCount();
         }
 
-        void RebuildView()
+        void RebuildView(bool recount = true)
         {
+            filterDelay.Stop();
             string[] query = KeywordRules.Parse(filter.Text);
             string[] collapse = KeywordRules.Parse(collapseFilter.Text);
-            var matching = ViewHistory.Lines.Where(line => PassesFilter(line.Text, query, collapse)).ToList();
-            matchCount = matching.Count;
-            int first = matchCount;
+            if (recount) matchCount = ViewHistory.Lines.Count(line => PassesFilter(line.Text, query, collapse));
+            var visible = new List<string>();
             int chars = 0;
-            while (first > 0)
+            foreach (LogLine line in ViewHistory.NewestFirst)
             {
-                int length = FormatLogLine(matching[first - 1]).Length + Environment.NewLine.Length;
+                if (!PassesFilter(line.Text, query, collapse)) continue;
+                string formatted = FormatLogLine(line);
+                int length = formatted.Length + Environment.NewLine.Length;
                 if (chars + length > DisplayLimit * 3 / 4) break;
                 chars += length;
-                first--;
+                visible.Add(formatted);
             }
-            hiddenMatches = first;
+            visible.Reverse();
+            hiddenMatches = matchCount - visible.Count;
             viewDirty = false;
-            output.ReplaceLogText(first == matchCount ? "" : string.Join(Environment.NewLine, matching.Skip(first).Select(FormatLogLine)) + Environment.NewLine, follow.Checked);
+            output.ReplaceLogText(visible.Count == 0 ? "" : string.Join(Environment.NewLine, visible) + Environment.NewLine, follow.Checked);
             UpdateCount();
         }
 
@@ -651,11 +715,12 @@ namespace SerialCom
 
         void UpdateControls()
         {
-            bool idle = serial == null;
+            bool idle = session == null;
+            bool stopping = session != null && session.Stopping;
             ports.Enabled = baud.Enabled = refresh.Enabled = settingsButton.Enabled = idle;
-            send.Enabled = !idle;
-            connect.Enabled = !idle || ports.SelectedItem != null;
-            connect.Text = idle ? "连接串口" : "断开串口";
+            send.Enabled = !idle && !stopping;
+            connect.Enabled = !stopping && (!idle || ports.SelectedItem != null);
+            connect.Text = stopping ? "正在断开…" : idle ? "连接串口" : "断开串口";
         }
 
         void SetStatus(string message, bool error)
@@ -670,27 +735,9 @@ namespace SerialCom
             count.Text = "显示 " + (viewDirty ? pausedDisplayCount : matchCount - hiddenMatches).ToString("N0") + " / 筛选后 " + matchCount.ToString("N0") +
                 " / 缓存 " + ViewHistory.Count.ToString("N0") + " 行 · RAM≈" +
                 ((history.EstimatedBytes + hexHistory.EstimatedBytes) / 1048576.0).ToString("F1") + "/" + serialSettings.LogRamMB + " MB · " +
-                (archiveError == null ? "原始日志自动保存（无上限）" : "日志保存失败：" + archiveError);
+                (archiveError == null ? "原始日志自动保存" : "通信/日志错误：" + archiveError) +
+                (skippedDisplayBytes == 0 ? "" : " · 界面已跳过 " + (skippedDisplayBytes / 1024) + " KB（接收日志仍保存）");
             count.ForeColor = archiveError == null ? Muted : Palette.Error;
-        }
-
-        void PrepareArchive()
-        {
-            try { archive.StartSession(); archiveError = null; UpdateCount(); }
-            catch (Exception error) { throw ArchiveFailure(error); }
-        }
-
-        void SaveRaw(byte[] bytes)
-        {
-            try { archive.Write(bytes); }
-            catch (Exception error) { throw ArchiveFailure(error); }
-        }
-
-        IOException ArchiveFailure(Exception error)
-        {
-            archiveError = error.Message;
-            UpdateCount();
-            return new IOException("原始日志保存失败，已停止通信，请检查磁盘空间和目录权限：" + error.Message, error);
         }
 
         void ApplyCacheBudget()
@@ -707,6 +754,168 @@ namespace SerialCom
             Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "SerialCom");
     }
 
+    sealed class SerialPacket
+    {
+        internal readonly byte[] Bytes;
+        internal readonly DateTime Timestamp;
+        internal readonly string SentText;
+        internal SerialPacket(byte[] bytes, string sentText = null)
+        { Bytes = bytes; SentText = sentText; Timestamp = DateTime.Now; }
+    }
+
+    interface ISerialTransport : IDisposable
+    {
+        int BytesToRead { get; }
+        int Read(byte[] bytes, int offset, int count);
+        void Write(byte[] bytes, int offset, int count);
+    }
+    sealed class SerialTransport : ISerialTransport
+    {
+        readonly SerialPort port;
+        internal SerialTransport(SerialPort port) { this.port = port; }
+        public int BytesToRead { get { return port.BytesToRead; } }
+        public int Read(byte[] bytes, int offset, int count) { return port.Read(bytes, offset, count); }
+        public void Write(byte[] bytes, int offset, int count) { port.Write(bytes, offset, count); }
+        public void Dispose() { port.Dispose(); }
+    }
+
+    // Only the reader owns the port; only the writer owns the archive.
+    // Neither worker invokes or waits for the UI thread.
+    sealed class SerialSession
+    {
+        readonly ISerialTransport port;
+        readonly string root;
+        readonly object gate = new object();
+        readonly Queue<SerialPacket> disk = new Queue<SerialPacket>();
+        readonly Queue<SerialPacket> display = new Queue<SerialPacket>();
+        readonly Queue<SerialPacket> sends = new Queue<SerialPacket>();
+        int diskBytes, displayBytes, sendBytes;
+        long skipped;
+        volatile bool stopping, readerDone, done;
+        string error;
+        internal bool Done { get { return done; } }
+        internal bool Stopping { get { return stopping; } }
+        internal string Error { get { lock (gate) return error; } }
+        internal SerialSession(SerialPort port, string root)
+            : this(new SerialTransport(port), root) { }
+        internal SerialSession(ISerialTransport port, string root)
+        {
+            this.port = port; this.root = root;
+            new System.Threading.Thread(WriteLoop) { IsBackground = true, Name = "SerialCom log" }.Start();
+        }
+        internal void Stop(string reason = null)
+        {
+            stopping = true;
+            lock (gate) { if (reason != null && error == null) error = reason; System.Threading.Monitor.PulseAll(gate); }
+        }
+        void Fail(Exception ex) { lock (gate) { if (error == null) error = ex.Message; } Stop(); }
+        internal void Send(byte[] bytes, string text)
+        {
+            lock (gate)
+            {
+                if (stopping) throw new IOException("串口正在关闭。");
+                if (sends.Count >= 32 || sendBytes + bytes.Length > 262144)
+                    throw new IOException("发送队列已满。");
+                sends.Enqueue(new SerialPacket(bytes, text)); sendBytes += bytes.Length;
+            }
+        }
+        void Display(SerialPacket packet)
+        {
+            lock (gate)
+            {
+                while (display.Count > 0 && (displayBytes + packet.Bytes.Length > 262144 || display.Count >= 1024))
+                { var old = display.Dequeue(); displayBytes -= old.Bytes.Length; skipped += old.Bytes.Length; }
+                display.Enqueue(packet); displayBytes += packet.Bytes.Length;
+            }
+        }
+        internal SerialPacket TakeDisplay(out long dropped)
+        {
+            lock (gate)
+            {
+                dropped = skipped; skipped = 0;
+                if (display.Count == 0) return null;
+                SerialPacket first = display.Dequeue(); displayBytes -= first.Bytes.Length;
+                if (first.SentText != null || display.Count == 0) return first;
+                // Coalesce reception into one UI update, bounded to 64 KB per tick.
+                using (var batch = new MemoryStream(65536))
+                {
+                    batch.Write(first.Bytes, 0, first.Bytes.Length);
+                    while (display.Count > 0 && display.Peek().SentText == null && batch.Length + display.Peek().Bytes.Length <= 65536)
+                    { var p = display.Dequeue(); displayBytes -= p.Bytes.Length; batch.Write(p.Bytes, 0, p.Bytes.Length); }
+                    return new SerialPacket(batch.ToArray());
+                }
+            }
+        }
+        void ReadLoop()
+        {
+            try
+            {
+                while (!stopping)
+                {
+                    SerialPacket tx = null;
+                    lock (gate) if (sends.Count > 0) { tx = sends.Dequeue(); sendBytes -= tx.Bytes.Length; }
+                    if (tx != null) { port.Write(tx.Bytes, 0, tx.Bytes.Length); Display(tx); }
+                    int available = Math.Min(port.BytesToRead, 16384);
+                    if (available == 0) { System.Threading.Thread.Sleep(5); continue; }
+                    byte[] bytes = new byte[available];
+                    int read = port.Read(bytes, 0, bytes.Length);
+                    if (read != bytes.Length) Array.Resize(ref bytes, read);
+                    var packet = new SerialPacket(bytes);
+                    lock (gate)
+                    {
+                        if (diskBytes + bytes.Length > 4194304 || disk.Count >= 4096)
+                            throw new IOException("日志磁盘写入跟不上接收，缓冲队列已满；已停止通信，末尾接收数据可能不完整。");
+                        disk.Enqueue(packet); diskBytes += bytes.Length;
+                        System.Threading.Monitor.PulseAll(gate);
+                    }
+                    Display(packet);
+                }
+            }
+            catch (Exception ex) { Fail(ex); }
+            finally
+            {
+                try { port.Dispose(); } catch (Exception ex) { Fail(ex); }
+                readerDone = true;
+                lock (gate) System.Threading.Monitor.PulseAll(gate);
+            }
+        }
+        void WriteLoop()
+        {
+            bool started = false;
+            try
+            {
+                using (var archive = new SessionLogArchive(root, () => DateTime.Now))
+                {
+                    archive.StartSession();
+                    new System.Threading.Thread(ReadLoop) { IsBackground = true, Name = "SerialCom receive" }.Start();
+                    started = true;
+                    var flushClock = Stopwatch.StartNew();
+                    while (true)
+                    {
+                        SerialPacket packet = null;
+                        lock (gate)
+                        {
+                            if (disk.Count == 0 && !readerDone) System.Threading.Monitor.Wait(gate, 100);
+                            if (disk.Count > 0) { packet = disk.Dequeue(); diskBytes -= packet.Bytes.Length; }
+                            else if (readerDone) break;
+                        }
+                        if (packet != null) archive.Write(packet.Bytes, packet.Timestamp);
+                        if (flushClock.ElapsedMilliseconds >= 1000) { archive.Flush(); flushClock.Restart(); }
+                    }
+                    archive.Flush();
+                }
+            }
+            catch (Exception ex) { Fail(ex); }
+            finally
+            {
+                Stop();
+                if (!started) { try { port.Dispose(); } catch (Exception ex) { Fail(ex); } }
+                else { lock (gate) while (!readerDone) System.Threading.Monitor.Wait(gate, 100); }
+                done = true;
+            }
+        }
+    }
+
     // Each successful port connection fixes its folder and files until disconnect.
     // Add line timestamps without decoding or filtering the received payload.
     sealed class SessionLogArchive : IDisposable
@@ -716,6 +925,7 @@ namespace SerialCom
         FileStream received;
         bool atLineStart;
         byte pendingNewline;
+        bool dirty;
 
         internal SessionLogArchive(string root, Func<DateTime> clock)
         {
@@ -745,6 +955,7 @@ namespace SerialCom
                         {
                             byte[] newline = Encoding.ASCII.GetBytes(Environment.NewLine);
                             received.Write(newline, 0, newline.Length);
+                            dirty = true;
                         }
                     }
                 }
@@ -756,10 +967,13 @@ namespace SerialCom
 
         static FileStream Open(string path)
         {
-            return new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
+            return new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read, 65536, FileOptions.SequentialScan);
         }
 
         internal void Write(byte[] bytes)
+        { Write(bytes, clock()); }
+
+        internal void Write(byte[] bytes, DateTime timestamp)
         {
             if (received == null) throw new IOException("日志会话尚未打开。");
             byte[] prefix = null;
@@ -779,7 +993,7 @@ namespace SerialCom
                 {
                     if (i > start) received.Write(bytes, start, i - start);
                     if (prefix == null)
-                        prefix = Encoding.ASCII.GetBytes("[" + clock().ToString("HH:mm:ss.fff",
+                        prefix = Encoding.ASCII.GetBytes("[" + timestamp.ToString("HH:mm:ss.fff",
                             System.Globalization.CultureInfo.InvariantCulture) + "]-> ");
                     received.Write(prefix, 0, prefix.Length);
                     start = i;
@@ -792,15 +1006,19 @@ namespace SerialCom
                 }
             }
             if (bytes.Length > start) received.Write(bytes, start, bytes.Length - start);
-            // Flush each received batch, including incomplete lines, to disk.
-            received.Flush(true);
+            dirty |= bytes.Length > 0;
+        }
+
+        internal void Flush()
+        {
+            if (received != null && dirty) { received.Flush(true); dirty = false; }
         }
 
         public void Dispose()
         {
             FileStream rx = received;
             received = null;
-            if (rx != null) rx.Dispose();
+            if (rx != null) { try { if (dirty) rx.Flush(true); } finally { dirty = false; rx.Dispose(); } }
         }
     }
 
@@ -842,7 +1060,20 @@ namespace SerialCom
 
     static class SerialData
     {
-        public static string ToHex(byte[] bytes) { return BitConverter.ToString(bytes).Replace('-', ' '); }
+        public static string ToHex(byte[] bytes) { return ToHexSlice(bytes, 0, bytes.Length); }
+        internal static string ToHexSlice(byte[] bytes, int offset, int count)
+        {
+            if (count == 0) return "";
+            const string digits = "0123456789ABCDEF";
+            var chars = new char[count * 3 - 1];
+            for (int i = 0; i < count; i++)
+            {
+                byte value = bytes[offset + i];
+                chars[i * 3] = digits[value >> 4]; chars[i * 3 + 1] = digits[value & 15];
+                if (i + 1 < count) chars[i * 3 + 2] = ' ';
+            }
+            return new string(chars);
+        }
 
         public static bool TryBuildPayload(string text, bool hex, SendEnding ending, out byte[] bytes, out string error)
         {
@@ -960,6 +1191,7 @@ namespace SerialCom
     {
         internal static readonly int[] LogRamChoices = { 8, 16, 32, 64, 128, 256 };
         public int LogRamMB = 16;
+        public string Theme = "System";
         public string TextEncodingName = "UTF-8";
         public Encoding TextEncoding { get { return TextEncodingName == "GBK" ? Encoding.GetEncoding(936) : Encoding.UTF8; } }
         internal static readonly string SettingsFile = Path.Combine(StoragePaths.Root, "SerialCom.ini");
@@ -1035,6 +1267,7 @@ namespace SerialCom
                     }
                     else if (key == "dataBits" && int.TryParse(value, out number) && number >= 5 && number <= 8) settings.DataBits = number;
                     else if (key == "logRamMB" && int.TryParse(value, out number) && LogRamChoices.Contains(number)) settings.LogRamMB = number;
+                    else if (key == "theme" && (value == "System" || value == "Light" || value == "Dark")) settings.Theme = value;
                     else if (key == "textEncoding" && (value == "UTF-8" || value == "GBK")) settings.TextEncodingName = value;
                     else if (key == "parity")
                     {
@@ -1138,6 +1371,7 @@ namespace SerialCom
             return string.Join("\n", new[]
                 {
                 "logRamMB=" + LogRamMB,
+                "theme=" + Theme,
                 "textEncoding=" + TextEncodingName,
                 "presets=" + string.Join(",", BaudPresets),
                 "parity=" + Parity,
@@ -1203,6 +1437,7 @@ namespace SerialCom
         public void CopyFrom(SerialSettings other)
         {
             LogRamMB = other.LogRamMB;
+            Theme = other.Theme;
             TextEncodingName = other.TextEncodingName;
             BaudPresets = new List<int>(other.BaudPresets);
             Parity = other.Parity;
@@ -1238,6 +1473,9 @@ namespace SerialCom
         readonly ComboBox handshake = new ThemeCombo();
         readonly ComboBox logRam = new ThemeCombo { AccessibleName = "日志 RAM 缓存" };
         readonly ComboBox textEncoding = new ThemeCombo { AccessibleName = "编码方式" };
+        readonly ComboBox theme = new ThemeCombo { AccessibleName = "主题" };
+        public event EventHandler ThemeChanged;
+        public string SelectedTheme { get { return theme.SelectedIndex == 2 ? "Dark" : theme.SelectedIndex == 1 ? "Light" : "System"; } }
         public SerialSettings Settings { get; private set; }
 
         public SerialSettingsDialog(SerialSettings current)
@@ -1251,12 +1489,12 @@ namespace SerialCom
             Font = new Font("Microsoft YaHei UI", 10);
             BackColor = Palette.Canvas;
             ForeColor = Palette.Ink;
-            ClientSize = new Size(520, 528);
+            ClientSize = new Size(520, 576);
 
-            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(20, 16, 20, 14), ColumnCount = 2, RowCount = 9 };
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(20, 16, 20, 14), ColumnCount = 2, RowCount = 10 };
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 115));
             layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            for (int i = 0; i < 7; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
+            for (int i = 0; i < 8; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 48));
             layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 92));
             layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
@@ -1283,8 +1521,11 @@ namespace SerialCom
             textEncoding.Items.AddRange(new object[] { "UTF-8", "GBK" });
             textEncoding.SelectedItem = current.TextEncodingName;
             AddRow(layout, 6, "编码方式", textEncoding);
+            theme.Items.AddRange(new object[] { "跟随系统", "浅色", "深色" });
+            theme.SelectedIndex = current.Theme == "Dark" ? 2 : current.Theme == "Light" ? 1 : 0;
+            AddRow(layout, 7, "主题", theme);
             var cacheNote = new Label { Dock = DockStyle.Fill, Text = "RAM 为文本与 HEX 缓存合计估算预算，各占一半；不含程序及界面内存，保存后立即生效。原始日志不受 RAM 限制。\n编码需与设备一致，用于文本收发及读取原始日志。\n连接期间修改编码，下次连接生效。", AutoSize = false };
-            layout.Controls.Add(cacheNote, 0, 7);
+            layout.Controls.Add(cacheNote, 0, 8);
             layout.SetColumnSpan(cacheNote, 2);
 
             var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, WrapContents = false, Padding = new Padding(0, 7, 0, 0) };
@@ -1292,14 +1533,29 @@ namespace SerialCom
             var cancel = new LogButton("取消", false) { Width = 84, DialogResult = DialogResult.Cancel };
             buttons.Controls.Add(cancel);
             buttons.Controls.Add(save);
-            layout.Controls.Add(buttons, 0, 8);
+            layout.Controls.Add(buttons, 0, 9);
             layout.SetColumnSpan(buttons, 2);
             Controls.Add(layout);
             MonitorWindow.ApplyColors(this, Palette.Canvas);
+            Shown += (s, e) => Palette.TitleBar(this);
+            theme.SelectedIndexChanged += (s, e) =>
+            {
+                var handler = ThemeChanged;
+                if (handler != null) handler(this, EventArgs.Empty);
+            };
 
             save.Click += (s, e) => SaveSettings();
             AcceptButton = save;
             CancelButton = cancel;
+        }
+
+        internal void ApplyTheme()
+        {
+            BackColor = Palette.Canvas;
+            ForeColor = Palette.Ink;
+            MonitorWindow.ApplyColors(this, Palette.Canvas);
+            Palette.TitleBar(this);
+            Invalidate(true);
         }
 
         static void AddRow(TableLayoutPanel layout, int row, string label, Control control)
@@ -1335,6 +1591,7 @@ namespace SerialCom
                 StopBits = stopBits.SelectedIndex == 0 ? StopBits.One : stopBits.SelectedIndex == 1 ? StopBits.OnePointFive : StopBits.Two,
                 Handshake = (Handshake)handshake.SelectedIndex,
                 LogRamMB = SerialSettings.LogRamChoices[logRam.SelectedIndex],
+                Theme = SelectedTheme,
                 TextEncodingName = (string)textEncoding.SelectedItem
             };
             DialogResult = DialogResult.OK;
@@ -1366,6 +1623,23 @@ namespace SerialCom
 
         public event EventHandler UserScrolled;
         bool updating;
+
+        internal void ApplyInk(Color color)
+        {
+            if (ForeColor == color) return;
+            if (!IsHandleCreated || TextLength == 0) { ForeColor = color; return; }
+
+            int start = SelectionStart;
+            int length = SelectionLength;
+            Point scroll = Point.Empty;
+            SendPoint(Handle, 0x4DD, IntPtr.Zero, ref scroll); // EM_GETSCROLLPOS
+            ForeColor = color;
+            SelectAll();
+            SelectionColor = color;
+            Select(start, length);
+            SendPoint(Handle, 0x4DE, IntPtr.Zero, ref scroll); // EM_SETSCROLLPOS
+            ClearUndo();
+        }
 
         public void AppendLogText(string text, bool followTail = true)
         {
@@ -1485,13 +1759,28 @@ namespace SerialCom
 
     sealed class LogLine
     {
-        public readonly string Text;
+        string text;
+        byte[] raw;
+        internal readonly int TextLength;
+        public string Text
+        {
+            get { if (text == null) { text = SerialData.ToHex(raw); raw = null; } return text; }
+        }
         public readonly DateTime Timestamp;
         public readonly string Direction;
 
         public LogLine(string text, DateTime timestamp, string direction)
         {
-            Text = text;
+            this.text = text;
+            TextLength = text.Length;
+            Timestamp = timestamp;
+            Direction = direction;
+        }
+        public LogLine(byte[] bytes, int offset, int count, DateTime timestamp, string direction)
+        {
+            raw = new byte[count];
+            Buffer.BlockCopy(bytes, offset, raw, 0, count);
+            TextLength = count == 0 ? 0 : count * 3 - 1;
             Timestamp = timestamp;
             Direction = direction;
         }
@@ -1502,7 +1791,7 @@ namespace SerialCom
         const int LineLimit = 8000;
         long budget = 8 * 1048576L;
         static readonly Regex Ansi = new Regex(@"\x1B\[[0-?]*[ -/]*[@-~]");
-        readonly Queue<LogLine> lines = new Queue<LogLine>();
+        readonly LinkedList<LogLine> lines = new LinkedList<LogLine>();
         readonly StringBuilder pending = new StringBuilder();
         bool truncated;
         long estimatedBytes;
@@ -1510,21 +1799,21 @@ namespace SerialCom
 
         // Conservative allowance for a LogLine, its UTF-16 string, alignment and
         // queue references. This is a cache estimate, not a process working-set cap.
-        static long Cost(LogLine line) { return 96L + ((line.Text.Length * 2L + 7) / 8 * 8); }
+        static long Cost(LogLine line) { return 144L + ((line.TextLength * 2L + 7) / 8 * 8); }
 
         public void SetBudget(long bytes)
         {
             if (bytes <= 0) throw new ArgumentOutOfRangeException("bytes");
             budget = bytes;
             Trim(line => { });
-            lines.TrimExcess();
         }
 
         void Trim(Action<LogLine> evicted)
         {
             while (estimatedBytes > budget && lines.Count > 0)
             {
-                LogLine removed = lines.Dequeue();
+                LogLine removed = lines.First.Value;
+                lines.RemoveFirst();
                 estimatedBytes -= Cost(removed);
                 evicted(removed);
             }
@@ -1532,6 +1821,11 @@ namespace SerialCom
 
         public int Count { get { return lines.Count; } }
         public IEnumerable<LogLine> Lines { get { return lines; } }
+        public IEnumerable<LogLine> NewestFirst
+        {
+            get { for (var node = lines.Last; node != null; node = node.Previous) yield return node.Value; }
+        }
+        public void ResetPending() { pending.Clear(); truncated = false; }
 
         public int Accept(string chunk, string direction, Action<LogLine> completed, Action<LogLine> evicted)
         {
@@ -1560,7 +1854,7 @@ namespace SerialCom
 
         public void Add(LogLine line, Action<LogLine> added, Action<LogLine> evicted)
         {
-            lines.Enqueue(line);
+            lines.AddLast(line);
             estimatedBytes += Cost(line);
             added(line);
             Trim(evicted);
@@ -1569,7 +1863,6 @@ namespace SerialCom
         public void Clear()
         {
             lines.Clear();
-            lines.TrimExcess();
             pending.Clear();
             truncated = false;
             estimatedBytes = 0;
@@ -1583,15 +1876,38 @@ namespace SerialCom
 
     static class Palette
     {
-        public static Color Canvas { get { return Color.FromArgb(243, 246, 252); } }
-        public static Color Surface { get { return Color.White; } }
-        public static Color Input { get { return Color.FromArgb(248, 250, 254); } }
-        public static Color Ink { get { return Color.FromArgb(23, 37, 62); } }
-        public static Color Muted { get { return Color.FromArgb(85, 104, 133); } }
-        public static Color Edge { get { return Color.FromArgb(210, 220, 237); } }
-        public static Color Hover { get { return Color.FromArgb(235, 241, 255); } }
-        public static Color Disabled { get { return Color.FromArgb(224, 230, 240); } }
-        public static Color Error { get { return Color.FromArgb(177, 54, 53); } }
+        internal static bool Dark;
+        internal static void SetTheme(string theme)
+        {
+            bool systemDark = false;
+            if (theme == "System")
+            {
+                try
+                {
+                    using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                        systemDark = key != null && Convert.ToInt32(key.GetValue("AppsUseLightTheme", 1)) == 0;
+                }
+                catch { }
+            }
+            Dark = theme == "Dark" || (theme == "System" && systemDark);
+        }
+        [DllImport("dwmapi.dll")]
+        static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
+        internal static void TitleBar(Form form)
+        {
+            try { int value = Dark ? 1 : 0; DwmSetWindowAttribute(form.Handle, 20, ref value, 4); }
+            catch (DllNotFoundException) { }
+            catch (EntryPointNotFoundException) { }
+        }
+        public static Color Canvas { get { return Dark ? Color.FromArgb(20, 24, 32) : Color.FromArgb(243, 246, 252); } }
+        public static Color Surface { get { return Dark ? Color.FromArgb(29, 35, 46) : Color.White; } }
+        public static Color Input { get { return Dark ? Color.FromArgb(23, 29, 39) : Color.FromArgb(248, 250, 254); } }
+        public static Color Ink { get { return Dark ? Color.FromArgb(229, 235, 245) : Color.FromArgb(23, 37, 62); } }
+        public static Color Muted { get { return Dark ? Color.FromArgb(160, 175, 196) : Color.FromArgb(85, 104, 133); } }
+        public static Color Edge { get { return Dark ? Color.FromArgb(57, 69, 88) : Color.FromArgb(210, 220, 237); } }
+        public static Color Hover { get { return Dark ? Color.FromArgb(43, 56, 78) : Color.FromArgb(235, 241, 255); } }
+        public static Color Disabled { get { return Dark ? Color.FromArgb(48, 57, 72) : Color.FromArgb(224, 230, 240); } }
+        public static Color Error { get { return Dark ? Color.FromArgb(255, 139, 135) : Color.FromArgb(177, 54, 53); } }
     }
 
     sealed class KeywordInput : ThemeInput
